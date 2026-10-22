@@ -1,0 +1,36 @@
+name: Atualizar cache da ANA
+
+# Todo dia às 06:00 de Manaus (10:00 UTC). Cada commit no main dispara um deploy novo na Vercel.
+on:
+  schedule:
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: atualizar-cache
+  cancel-in-progress: false
+
+jobs:
+  atualizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python aquecer_cache.py
+        env:
+          RIOS_LIMITE_MIN: "300"
+      - name: Commit do cache
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add cache_rios
+          git diff --cached --quiet && exit 0
+          git commit -m "Atualiza cache da ANA ($(date -u +%F))"
+          git push
