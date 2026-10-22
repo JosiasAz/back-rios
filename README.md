@@ -9,6 +9,23 @@ API (FastAPI) com o nível dos rios da Amazônia e do Pantanal, a partir da tele
 | `GET /api/serie?estacao=manaus&anos=3` | Resumo de 1 a 5 anos + série diária em metros |
 | `GET /api/referencia?estacao=manaus` | Recordes, mediana, percentis e "normal para a época" de toda a história |
 
+## Servidor MCP
+
+O mesmo app atende MCP (streamable HTTP, sem estado) em **`https://back-rios.vercel.app/mcp`**.
+
+| Ferramenta | O que faz |
+|---|---|
+| `listar_estacoes(uf)` | Estações disponíveis |
+| `nivel_atual(estacao)` | Última leitura e variação em 24 h e 7 dias (consulta a ANA na hora) |
+| `relatorio_nivel(estacao, anos)` | Resumo de 1 a 5 anos + `painel_url` com o gráfico no front |
+| `comparar_estacoes(estacoes, anos)` | 2 a 4 estações lado a lado |
+| `historico_nivel(estacao)` | Recordes de todos os tempos e maiores cheias/secas |
+
+Também expõe o resource `rios://estacoes`. Diferente do `servidor_rios.py` do exercício, não gera PNG
+(a Vercel não guarda arquivos): o gráfico é o próprio front, no link `painel_url` (`RIOS_FRONT_URL`).
+
+No Claude Code: `claude mcp add --transport http rios https://back-rios.vercel.app/mcp`
+
 ## Como funciona o cache
 
 A ANA demora ~1,5 min por mês de dados, então a API lê tudo de `cache_rios/`, que fica no repositório.

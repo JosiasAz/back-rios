@@ -5,6 +5,7 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
     "httpx>=0.28",
+    "fastmcp>=3,<4",
 ]
 
 [tool.vercel]

@@ -1,4 +1,5 @@
-"""API de níveis de rios (telemetria da ANA, sem chave) para o front-rios.
+"""API de níveis de rios (telemetria da ANA, sem chave) para o front-rios, e o mesmo
+conteúdo como servidor MCP (streamable HTTP, sem estado) em /mcp.
 
 Fonte: https://telemetriaws1.ana.gov.br/ServiceANA.asmx (leituras a cada 15 min, nível em cm).
 A ANA é lenta (~1,5 min por mês de telemetria), então tudo é lido de um cache em disco:
@@ -19,16 +20,19 @@ import xml.etree.ElementTree as ET
 from contextlib import nullcontext
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastmcp import FastMCP
 
 RAIZ = Path(__file__).resolve().parent
 SEMENTE = RAIZ / "cache_rios"  # cache versionado no repositório
 NA_VERCEL = bool(os.environ.get("VERCEL"))
 CACHE = Path("/tmp/cache_rios") if NA_VERCEL else SEMENTE  # na Vercel só /tmp aceita escrita
 INDICE = "indice.json"  # arquivo do cache -> quando foi baixado (o git troca o mtime pela hora do clone)
+FRONT_URL = os.environ.get("RIOS_FRONT_URL", "https://front-end-rios.vercel.app").rstrip("/")
 
 log = logging.getLogger("rios")
 
@@ -408,12 +412,24 @@ def _resumo(chave: str, est: dict, serie: dict, hoje: date) -> dict:
     }
 
 
-app = FastAPI(title="Rios (ANA)")
-# O front chama a API pelo rewrite /api da Vercel (mesma origem); o CORS libera chamadas diretas.
+mcp = FastMCP(
+    "rios",
+    instructions="Nível dos rios da Amazônia e do Pantanal (telemetria da ANA): AM, PA, RO, AC, RR e MS. "
+    "Comece por listar_estacoes; para o nível de um rio use relatorio_nivel e mostre o painel_url ao usuário.",
+)
+# Sem estado e com respostas JSON: na Vercel cada requisição pode cair numa instância diferente.
+mcp_app = mcp.http_app(path="/mcp", stateless_http=True, json_response=True, host_origin_protection=False)
+
+# O lifespan do MCP precisa ir para o FastAPI, senão o gerenciador de sessões HTTP não inicia.
+app = FastAPI(title="Rios (ANA)", lifespan=mcp_app.lifespan)
+# O front chama a API pelo rewrite /api da Vercel (mesma origem); o CORS libera chamadas diretas
+# e clientes MCP no navegador (ex.: MCP Inspector).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.environ.get("RIOS_ORIGENS", "*").split(","),
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["*"],
+    expose_headers=["mcp-session-id"],
 )
 
 
@@ -427,7 +443,11 @@ def _resolver_http(estacao: str) -> tuple[str, dict]:
 @app.get("/")
 @app.get("/api")
 def raiz() -> dict:
-    return {"api": "rios", "rotas": ["/api/estacoes", "/api/serie?estacao=manaus&anos=3", "/api/referencia?estacao=manaus"]}
+    return {
+        "api": "rios",
+        "rotas": ["/api/estacoes", "/api/serie?estacao=manaus&anos=3", "/api/referencia?estacao=manaus"],
+        "mcp": "/mcp",
+    }
 
 
 @app.get("/api/estacoes")
@@ -505,3 +525,156 @@ async def api_referencia(estacao: str = "manaus") -> dict:
         "percentis_m": [_m(valores[round(p / 100 * (len(valores) - 1))]) for p in range(0, 101, 5)],
         "mediana_por_mes_m": [_m(statistics.median(por_mes[m])) if m in por_mes else None for m in range(1, 13)],
     }
+
+
+# --- MCP: as mesmas consultas como ferramentas. Sem PNG (a Vercel não guarda arquivos);
+# o gráfico interativo fica no front, em painel_url.
+
+
+def _painel_url(chave: str, anos: int) -> str:
+    return f"{FRONT_URL}/?{urlencode({'estacao': chave, 'anos': anos})}"
+
+
+def _erro_mcp(erro: Exception) -> ValueError:
+    """HTTPException vira ValueError: o cliente MCP mostra a mensagem ao modelo."""
+    return ValueError(getattr(erro, "detail", None) or str(erro))
+
+
+@mcp.tool
+def listar_estacoes(uf: str = "") -> list[dict]:
+    """Estações de rios disponíveis (chave, rio, cidade, UF e código ANA). Filtre por UF, ex.: 'AM'."""
+    return api_estacoes(uf)
+
+
+@mcp.tool
+async def nivel_atual(estacao: str = "manaus") -> dict:
+    """Última leitura do nível do rio (m) e variação nas últimas 24 h e 7 dias."""
+    chave, est = _resolver(estacao)
+    hoje = date.today()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(PRAZO_RESPOSTA_S, connect=15.0)) as cliente:
+        leituras = await _baixar(cliente, est["codigo"], hoje - timedelta(days=8), hoje + timedelta(days=1))
+    if not leituras:
+        raise ValueError(f"Sem leituras recentes para {est['rio']} em {est['cidade']}.")
+    leituras.sort()
+    quando, valor = leituras[-1]
+    ultimo = datetime.fromisoformat(quando)
+
+    def variacao(dias: int) -> float | None:
+        alvo = (ultimo - timedelta(days=dias)).isoformat(sep=" ")
+        antes = [v for q, v in leituras if q <= alvo]
+        return _m(valor - antes[-1]) if antes else None
+
+    return {
+        "estacao": chave,
+        "rio": est["rio"],
+        "cidade": est["cidade"],
+        "uf": est["uf"],
+        "nivel_m": _m(valor),
+        "data_hora": quando,
+        "variacao_24h_m": variacao(1),
+        "variacao_7d_m": variacao(7),
+        "dica": "Para o relatório de vários anos, use relatorio_nivel.",
+    }
+
+
+@mcp.tool
+async def relatorio_nivel(estacao: str = "manaus", anos: int = 2) -> dict:
+    """Relatório do nível do rio de N anos atrás até hoje (1 a 5, padrão 2).
+
+    Use sempre que o usuário pedir o nível de um rio. Devolve atual, máximo, mínimo,
+    média, comparação com 1 e 2 anos atrás, resumo mensal e painel_url (gráfico interativo).
+    Para recordes de todos os tempos, use historico_nivel.
+    """
+    try:
+        resumo = await api_serie(estacao, anos)
+    except HTTPException as erro:
+        raise _erro_mcp(erro) from erro
+    del resumo["serie"]  # milhares de pontos: o gráfico está no painel
+    resumo["painel_url"] = _painel_url(resumo["estacao"], max(1, min(int(anos), 5)))
+    return resumo
+
+
+@mcp.tool
+async def comparar_estacoes(estacoes: list[str], anos: int = 2) -> dict:
+    """Compara o nível de 2 a 4 rios/estações de N anos atrás até hoje."""
+    if not 2 <= len(estacoes) <= 4:
+        raise ValueError("Informe de 2 a 4 estações, ex.: ['manaus', 'porto_velho'].")
+    anos = max(1, min(int(anos), 5))
+    resolvidas = [_resolver(e) for e in estacoes]
+    hoje = date.today()
+    series = await asyncio.gather(*[_serie_diaria(e["codigo"], _anos_atras(hoje, anos), hoje) for _, e in resolvidas])
+    resumos = []
+    for (chave, est), (serie, falhas, pendentes, atualizando) in zip(resolvidas, series):
+        resumo = _resumo(chave, est, serie, hoje)
+        resumo.pop("resumo_mensal")
+        resumo.update(meses_sem_dados=falhas, meses_ainda_baixando=pendentes, atualizando=atualizando,
+                      painel_url=_painel_url(chave, anos))
+        resumos.append(resumo)
+    return {"estacoes": resumos}
+
+
+def _resumo_historico(chave: str, est: dict, diario: dict[str, float]) -> dict:
+    """Recordes de todos os tempos e as maiores cheias/secas anuais (anos com ≥ 180 dias medidos)."""
+    d_max = max(diario, key=diario.get)
+    d_min = min(diario, key=diario.get)
+    ultimo = max(diario)
+    por_ano: dict[str, list[str]] = {}
+    for d in diario:
+        por_ano.setdefault(d[:4], []).append(d)
+    anuais = []
+    for ano, dias in por_ano.items():
+        if len(dias) >= 180:
+            dmx, dmn = max(dias, key=diario.get), min(dias, key=diario.get)
+            anuais.append({"ano": int(ano), "max_m": _m(diario[dmx]), "data_max": dmx,
+                           "min_m": _m(diario[dmn]), "data_min": dmn})
+    cheias = sorted(anuais, key=lambda a: -a["max_m"])[:5]
+    secas = sorted(anuais, key=lambda a: a["min_m"])[:5]
+    return {
+        "estacao": chave,
+        "rio": est["rio"],
+        "cidade": est["cidade"],
+        "uf": est["uf"],
+        "codigo_ana": est["codigo"],
+        "periodo": {"inicio": min(diario), "fim": ultimo, "anos_com_dados": len(anuais)},
+        "recorde_maximo_m": _m(diario[d_max]),
+        "data_recorde_maximo": d_max,
+        "recorde_minimo_m": _m(diario[d_min]),
+        "data_recorde_minimo": d_min,
+        "media_historica_m": _m(statistics.fmean(diario.values())),
+        "atual_m": _m(diario[ultimo]),
+        "data_atual": ultimo,
+        "maiores_cheias": [{"ano": a["ano"], "max_m": a["max_m"], "data": a["data_max"]} for a in cheias],
+        "maiores_secas": [{"ano": a["ano"], "min_m": a["min_m"], "data": a["data_min"]} for a in secas],
+        "observacao": "Cota da régua da ANA (referência local da estação), não profundidade do rio. "
+        "Até ~2014: série convencional (1–2 leituras/dia); depois: telemetria (mediana diária).",
+    }
+
+
+@mcp.tool
+def historico_nivel(estacao: str = "manaus") -> dict:
+    """Recordes de TODOS OS TEMPOS do rio (máximo e mínimo históricos, desde o início da
+    estação, em alguns casos ~1900) e as 5 maiores cheias e secas anuais.
+
+    Use quando o usuário pedir nível máximo/mínimo histórico, recorde, maior cheia ou seca.
+    """
+    chave, est = _resolver(estacao)
+    diario, completo = _diario_em_cache(est["codigo"])
+    if not diario:
+        return {"estacao": chave, "rio": est["rio"], "cidade": est["cidade"], "completo": False,
+                "pendente": "série histórica da ANA ainda baixando; pergunte de novo em alguns minutos."}
+    resumo = _resumo_historico(chave, est, dict(sorted(diario.items())))
+    resumo["completo"] = completo
+    if not completo:
+        resumo["pendente"] = "parte do histórico ainda não está em cache; os recordes podem mudar."
+    resumo["painel_url"] = _painel_url(chave, 5)
+    return resumo
+
+
+@mcp.resource("rios://estacoes")
+def recurso_estacoes() -> str:
+    """Catálogo das estações em JSON."""
+    return json.dumps(ESTACOES, ensure_ascii=False, indent=2)
+
+
+# Por último: montado em "/", o app do MCP (que atende em /mcp) não encobre as rotas acima.
+app.mount("/", mcp_app)
