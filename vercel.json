@@ -2,10 +2,9 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "regions": ["gru1"],
   "functions": {
-    "api/index.py": {
+    "rios.py": {
       "maxDuration": 60,
       "includeFiles": "cache_rios/**"
     }
-  },
-  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }]
+  }
 }

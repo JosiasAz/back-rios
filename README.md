@@ -1,4 +1,4 @@
-# back-rios
+﻿# back-rios
 
 API (FastAPI) com o nível dos rios da Amazônia e do Pantanal, a partir da telemetria da ANA.
 É o back-end do [front-end-rios](https://github.com/JosiasAz/front-end-rios).
@@ -33,7 +33,7 @@ Para completar o cache na sua máquina: `python aquecer_cache.py` (`RIOS_LIMITE_
 ## Deploy na Vercel
 
 1. Crie o repositório no GitHub e faça o push deste diretório.
-2. Na Vercel: **Add New → Project**, importe o repositório. Framework Preset: **Other**. Não precisa de build command nem variáveis.
+2. Na Vercel: **Add New → Project**, importe o repositório. A Vercel detecta a FastAPI pelo `pyproject.toml` (`entrypoint = "rios:app"`). Não precisa de build command nem variáveis.
 3. A função roda em São Paulo (`gru1`) com até 60 s por requisição (`vercel.json`).
 4. No GitHub, rode o workflow **Atualizar cache da ANA** uma vez à mão (aba *Actions* → *Run workflow*) para completar o cache.
 
